@@ -168,3 +168,85 @@ st.dataframe(by_prompt, use_container_width=True, hide_index=True)
 with st.expander("Raw answers"):
     st.dataframe(df[["time", "model", "prompt", "mentioned", "position", "answer"]], use_container_width=True)
 st.download_button("Download results (CSV)", df.drop(columns=["brands"]).to_csv(index=False), "results.csv")
+
+
+# ---------- Chat panel ----------
+def data_summary(df, brand):
+    all_b = df["brands"].explode().dropna()
+    return (
+        f"Brand: {brand}\n"
+        f"Overall mention rate: {df['mentioned'].mean():.0%}\n"
+        f"Mention rate by model:\n{df.groupby('model')['mentioned'].mean().round(2).to_string()}\n"
+        f"Mention rate by category:\n{df.groupby('category')['mentioned'].mean().round(2).to_string()}\n"
+        f"Brand mention counts:\n{all_b.value_counts().to_string()}\n"
+        f"Mention rate by prompt:\n{df.groupby('prompt')['mentioned'].mean().round(2).to_string()}"
+    )
+
+
+def rule_based_answer(q, df, brand):
+    """Keyword-based answers computed directly from the data. No LLM, no API key needed."""
+    q = q.lower()
+    all_b = df["brands"].explode().dropna()
+    if any(w in q for w in ["competitor", "rival", "who", "share of voice"]):
+        top = all_b[all_b != brand].value_counts().head(3)
+        lines = ", ".join(f"**{n}** ({c} mentions)" for n, c in top.items())
+        return f"The most frequently recommended competitors are {lines}. Our brand has {(all_b == brand).sum()} mentions."
+    if any(w in q for w in ["model", "chatgpt", "claude", "openai", "anthropic"]):
+        r = df.groupby("model")["mentioned"].mean().sort_values(ascending=False)
+        lines = "; ".join(f"**{m}**: {v:.0%}" for m, v in r.items())
+        return f"Mention rate by model: {lines}."
+    if any(w in q for w in ["categor", "weak", "strong", "worst", "best"]):
+        r = df.groupby("category")["mentioned"].mean().sort_values()
+        return (f"Our weakest category is **{r.index[0]}** ({r.iloc[0]:.0%} mention rate) "
+                f"and our strongest is **{r.index[-1]}** ({r.iloc[-1]:.0%}).")
+    if any(w in q for w in ["position", "rank", "first", "order"]):
+        pos = df.loc[df["mentioned"], "position"]
+        return f"When we are mentioned, we appear at an average position of **{pos.mean():.1f}** (1 = first brand named)."
+    if "prompt" in q or "question" in q:
+        r = df.groupby("prompt")["mentioned"].mean().sort_values()
+        return f"Our weakest prompt is \"{r.index[0]}\" at {r.iloc[0]:.0%} mention rate."
+    return (f"Overall we are mentioned in **{df['mentioned'].mean():.0%}** of answers. "
+            "Try asking about competitors, models, categories, or our average position.")
+
+
+def chat_answer(q, df, brand):
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            prompt = ("You are an analyst for an AI-visibility tracker. Answer ONLY from the data below; "
+                      "if the data cannot answer, say so. Be concise.\n\n"
+                      f"DATA:\n{data_summary(df, brand)}\n\nQUESTION: {q}")
+            return ask_anthropic(prompt)
+        except Exception as e:
+            return f"LLM call failed ({e}). Falling back:\n\n" + rule_based_answer(q, df, brand)
+    return rule_based_answer(q, df, brand)
+
+
+st.divider()
+st.subheader("Ask the data")
+if os.environ.get("ANTHROPIC_API_KEY"):
+    st.caption("AI assistant: answers are generated from the results above.")
+else:
+    st.caption("Demo assistant: answers are calculated from the results above using simple rules (no live LLM connected).")
+
+SUGGESTED = ["Who are our top competitors?", "Which model mentions us most?", "What is our weakest category?"]
+if "chat" not in st.session_state:
+    st.session_state["chat"] = []
+
+clicked = None
+for col, s in zip(st.columns(len(SUGGESTED)), SUGGESTED):
+    if col.button(s, use_container_width=True):
+        clicked = s
+question = st.chat_input("Ask about your AI visibility data...") or clicked
+
+for m in st.session_state["chat"]:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+if question:
+    st.session_state["chat"].append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+    reply = chat_answer(question, df, brand)
+    st.session_state["chat"].append({"role": "assistant", "content": reply})
+    with st.chat_message("assistant"):
+        st.markdown(reply)
